@@ -90,4 +90,93 @@ router.post('/kiwify', async (req: Request, res: Response) => {
   return res.status(200).json({ message: 'Evento ignorado.' });
 });
 
+const HOTMART_HOTTOK = process.env.HOTMART_HOTTOK ?? '';
+
+/**
+ * Valida o token (hottok) que a Hotmart envia no header `X-HOTMART-HOTTOK`.
+ * Diferente da Kiwify, não é HMAC: é um token fixo gerado no painel da Hotmart.
+ * Sem token configurado, a requisição é recusada (evita cadastro por terceiros).
+ */
+function isValidHottok(received?: string): boolean {
+  if (!HOTMART_HOTTOK || !received) return false;
+  const a = Buffer.from(received);
+  const b = Buffer.from(HOTMART_HOTTOK);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// POST /api/webhooks/hotmart
+// Recebe a notificação (Webhook v2.0.0) da Hotmart e cadastra/desativa o aluno.
+router.post('/hotmart', async (req: Request, res: Response) => {
+  if (!isValidHottok(req.header('x-hotmart-hottok'))) {
+    console.warn('[Webhook Hotmart] Hottok inválido ou ausente — requisição rejeitada.');
+    return res.status(401).json({ error: 'Token inválido.' });
+  }
+
+  const body = req.body ?? {};
+  const event: string | undefined = body.event;
+  const buyer = body.data?.buyer ?? {};
+  const transaction: string | undefined = body.data?.purchase?.transaction;
+
+  console.log('[Webhook Hotmart] Evento recebido:', event, transaction ?? '');
+
+  const email: string | undefined = buyer.email?.trim?.()?.toLowerCase();
+  const name: string = buyer.name ?? '';
+
+  if (!email || !email.includes('@')) {
+    console.warn('[Webhook Hotmart] Payload sem email válido.', { event });
+    return res.status(400).json({ error: 'Email não encontrado no payload.' });
+  }
+
+  // Compra aprovada → cadastra/ativa o aluno (sem rebaixar quem já é admin)
+  if (event === 'PURCHASE_APPROVED' || event === 'PURCHASE_COMPLETE') {
+    const { data: existing, error: findError } = await supabase
+      .from('students')
+      .select('email')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (findError) {
+      console.error('[Webhook Hotmart] Erro ao consultar aluno:', findError);
+      return res.status(500).json({ error: 'Erro ao cadastrar aluno.' });
+    }
+
+    const { error } = existing
+      ? await supabase.from('students').update({ active: true }).eq('email', email)
+      : await supabase.from('students').insert({ email, name, role: 'student', active: true });
+
+    if (error) {
+      console.error('[Webhook Hotmart] Erro ao cadastrar aluno:', error);
+      return res.status(500).json({ error: 'Erro ao cadastrar aluno.' });
+    }
+
+    console.log(`[Webhook Hotmart] Aluno cadastrado/ativado: ${email}`);
+    return res.status(200).json({ message: 'Aluno cadastrado com sucesso.' });
+  }
+
+  // Reembolso, chargeback, cancelamento → desativa o acesso (mantém o registro)
+  if (
+    event === 'PURCHASE_REFUNDED' ||
+    event === 'PURCHASE_CHARGEBACK' ||
+    event === 'PURCHASE_CANCELED'
+  ) {
+    const { error } = await supabase
+      .from('students')
+      .update({ active: false })
+      .eq('email', email)
+      .eq('role', 'student');
+
+    if (error) {
+      console.error('[Webhook Hotmart] Erro ao desativar aluno:', error);
+      return res.status(500).json({ error: 'Erro ao desativar aluno.' });
+    }
+
+    console.log(`[Webhook Hotmart] Acesso desativado (${event}): ${email}`);
+    return res.status(200).json({ message: 'Acesso desativado.' });
+  }
+
+  console.log(`[Webhook Hotmart] Evento ignorado (${event}): ${email}`);
+  return res.status(200).json({ message: 'Evento ignorado.' });
+});
+
 export default router;
